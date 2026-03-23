@@ -20,6 +20,10 @@
 #    include <pthread.h>
 #    include <sys/mman.h>
 #    include <unistd.h>
+#    if TARGET_OS_IPHONE
+#        include <signal.h>
+#        include <sys/ucontext.h>
+#    endif
 #else
 #    if !defined(_GNU_SOURCE)
 #        define _GNU_SOURCE
@@ -31,6 +35,10 @@
 
 namespace oaknut {
 
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+extern "C" int csops(int, unsigned int, void*, size_t);
+#endif
+
 class DualCodeBlock {
 public:
     explicit DualCodeBlock(std::size_t size)
@@ -41,16 +49,77 @@ public:
         if (m_wmem == nullptr)
             throw std::bad_alloc{};
 #elif defined(__APPLE__)
-        m_wmem = (std::uint32_t*)mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
-        if (m_wmem == MAP_FAILED)
+#if TARGET_OS_IPHONE
+        auto has_cs_debugged = []() -> bool {
+            int flags = 0;
+            return !csops(0, 0 /*CS_OPS_STATUS*/, &flags, sizeof(flags)) && (flags & 0x10000000 /*CS_DEBUGGED*/);
+        };
+        bool use_brk_path = false;
+        if (__builtin_available(iOS 26, *))
+            use_brk_path = has_cs_debugged();
+        if (use_brk_path) {
+            // iOS 26+ with debugger: mmap R-X first, brk to bless pages, remap for R-W.
+            // mprotect cannot add PROT_EXEC on iOS 26, so pages must start executable.
+            m_xmem = (std::uint32_t*)mmap(nullptr, size, PROT_READ | PROT_EXEC, MAP_ANON | MAP_PRIVATE, -1, 0);
+            if (m_xmem == MAP_FAILED)
+                throw std::bad_alloc{};
+
+            // Notify the debugger about the executable region.
+            {
+                static volatile bool s_brk_trapped;
+                static struct sigaction s_prev_trap;
+                struct sigaction trap_act = {};
+                trap_act.sa_sigaction = [](int, siginfo_t*, void* ctx) {
+                    s_brk_trapped = true;
+                    ((ucontext_t*)ctx)->uc_mcontext->__ss.__pc += 4;
+                };
+                sigemptyset(&trap_act.sa_mask);
+                trap_act.sa_flags = SA_SIGINFO;
+                sigaction(SIGTRAP, &trap_act, &s_prev_trap);
+                s_brk_trapped = false;
+                __asm__ volatile(
+                    "mov x0, %0\n"
+                    "mov x1, %1\n"
+                    "brk #0x69"
+                    :: "r"(m_xmem), "r"(size)
+                    : "x0", "x1", "memory"
+                );
+                sigaction(SIGTRAP, &s_prev_trap, nullptr);
+            }
+
+            vm_prot_t cur_prot, max_prot;
+            kern_return_t ret = vm_remap(mach_task_self(), (vm_address_t*)&m_wmem, size, 0, VM_FLAGS_ANYWHERE | VM_FLAGS_RANDOM_ADDR, mach_task_self(), (mach_vm_address_t)m_xmem, false, &cur_prot, &max_prot, VM_INHERIT_NONE);
+            if (ret != KERN_SUCCESS)
+                throw std::bad_alloc{};
+
+            mprotect(m_wmem, size, PROT_READ | PROT_WRITE);
+        } else {
+            // Pre-iOS 26: mmap R-W, remap, mprotect R-X. The debugger
+            // attachment allows mprotect to add PROT_EXEC.
+            m_wmem = (std::uint32_t*)mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+            if (m_wmem == MAP_FAILED)
+                throw std::bad_alloc{};
+
+            vm_prot_t cur_prot, max_prot;
+            kern_return_t ret = vm_remap(mach_task_self(), (vm_address_t*)&m_xmem, size, 0, VM_FLAGS_ANYWHERE | VM_FLAGS_RANDOM_ADDR, mach_task_self(), (mach_vm_address_t)m_wmem, false, &cur_prot, &max_prot, VM_INHERIT_NONE);
+            if (ret != KERN_SUCCESS)
+                throw std::bad_alloc{};
+
+            mprotect(m_xmem, size, PROT_READ | PROT_EXEC);
+        }
+#else
+        // macOS: mmap R-X first, remap for R-W. No brk needed.
+        m_xmem = (std::uint32_t*)mmap(nullptr, size, PROT_READ | PROT_EXEC, MAP_ANON | MAP_PRIVATE, -1, 0);
+        if (m_xmem == MAP_FAILED)
             throw std::bad_alloc{};
 
         vm_prot_t cur_prot, max_prot;
-        kern_return_t ret = vm_remap(mach_task_self(), (vm_address_t*)&m_xmem, size, 0, VM_FLAGS_ANYWHERE | VM_FLAGS_RANDOM_ADDR, mach_task_self(), (mach_vm_address_t)m_wmem, false, &cur_prot, &max_prot, VM_INHERIT_NONE);
+        kern_return_t ret = vm_remap(mach_task_self(), (vm_address_t*)&m_wmem, size, 0, VM_FLAGS_ANYWHERE | VM_FLAGS_RANDOM_ADDR, mach_task_self(), (mach_vm_address_t)m_xmem, false, &cur_prot, &max_prot, VM_INHERIT_NONE);
         if (ret != KERN_SUCCESS)
             throw std::bad_alloc{};
 
-        mprotect(m_xmem, size, PROT_READ | PROT_EXEC);
+        mprotect(m_wmem, size, PROT_READ | PROT_WRITE);
+#endif
 #else
 #    if defined(__OpenBSD__)
         char tmpl[] = "oaknut_dual_code_block.XXXXXXXXXX";
@@ -81,6 +150,8 @@ public:
 #if defined(_WIN32)
         VirtualFree((void*)m_xmem, 0, MEM_RELEASE);
 #elif defined(__APPLE__)
+        munmap(m_xmem, m_size);
+        vm_deallocate(mach_task_self(), (vm_address_t)m_wmem, m_size);
 #else
         munmap(m_wmem, m_size);
         munmap(m_xmem, m_size);
